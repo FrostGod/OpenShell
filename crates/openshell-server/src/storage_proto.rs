@@ -134,8 +134,10 @@ mod tests {
     // Driver-operation ownership adds pending and a retained operation ID to
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
+    // SessionRedirect and SupervisorHello.redirected are supervisor control
+    // traffic and are never stored.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "18206c52e68fdb0af60f8bb8dfaf47d9bc8021222cb49cacffab6352d3ad5549";
+        "eeddf755d03afdb0fa18941274b56dcd6d55d95dd2b2e0641e80264b9c90f82d";
     const DURABLE_SCHEMA_SHA256: &str =
         "76487ab369fc3a4b03a179bb5e7ea6be8d20e380ad5563075dff8ee50e539406";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -604,7 +606,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (306, 27),
+                (307, 27),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
