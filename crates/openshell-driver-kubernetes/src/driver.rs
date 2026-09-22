@@ -102,8 +102,8 @@ const ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC: &str =
 const ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL: &str = "openshell.ai/sandbox-runtime-log-level";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-network-policy-uid";
-const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION: &str =
-    "openshell.ai/sandbox-runtime-network-policy-version";
+const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: &str =
+    "openshell.ai/sandbox-runtime-network-policy-generation";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SandboxRuntimeBootstrapPhase {
@@ -2502,6 +2502,9 @@ impl KubernetesComputeDriver {
         let fence_uid = fence.metadata.uid.ok_or_else(|| {
             KubernetesDriverError::Message("workload NetworkPolicy has no UID".to_string())
         })?;
+        let fence_generation = fence.metadata.generation.ok_or_else(|| {
+            KubernetesDriverError::Message("workload NetworkPolicy has no generation".to_string())
+        })?;
         let fence_resource_version = fence.metadata.resource_version.ok_or_else(|| {
             KubernetesDriverError::Message(
                 "workload NetworkPolicy has no resourceVersion".to_string(),
@@ -2551,7 +2554,7 @@ impl KubernetesComputeDriver {
                         ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
                         ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
                         ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION: fence_resource_version.clone(),
+                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
                     }
                 }
             })
@@ -2789,6 +2792,9 @@ impl KubernetesComputeDriver {
         let fence_uid = fence.metadata.uid.ok_or_else(|| {
             KubernetesDriverError::Message("workload NetworkPolicy has no UID".to_string())
         })?;
+        let fence_generation = fence.metadata.generation.ok_or_else(|| {
+            KubernetesDriverError::Message("workload NetworkPolicy has no generation".to_string())
+        })?;
         let fence_resource_version = fence.metadata.resource_version.ok_or_else(|| {
             KubernetesDriverError::Message(
                 "workload NetworkPolicy has no resourceVersion".to_string(),
@@ -2830,7 +2836,7 @@ impl KubernetesComputeDriver {
                         ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: workload_pod_uid.clone(),
                         ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid,
                         ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: fence_uid.clone(),
-                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION: fence_resource_version.clone(),
+                        ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: fence_generation.to_string(),
                     }
                 }
             })
@@ -5511,9 +5517,12 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
         ));
         let (dependencies, workload_generation, supervisor_generation) =
             tokio::join!(dependencies, workload_generation, supervisor_generation);
-        if dependencies != SandboxRuntimeControlAvailability::Available
-            || workload_generation != SandboxRuntimeControlAvailability::Available
-            || supervisor_generation != SandboxRuntimeControlAvailability::Available
+        // A transient API read failure is not evidence that the running
+        // boundary disappeared. Preserve the CR's published readiness for
+        // Unknown and let periodic reconciliation retry.
+        if dependencies == SandboxRuntimeControlAvailability::Unavailable
+            || workload_generation == SandboxRuntimeControlAvailability::Unavailable
+            || supervisor_generation == SandboxRuntimeControlAvailability::Unavailable
         {
             mark_sandbox_runtime_control_unavailable(&mut sandbox);
         }
@@ -6752,6 +6761,22 @@ fn required_sandbox_annotation(
         })
 }
 
+fn condition_observes_current_generation(
+    object: &DynamicObject,
+    condition: &serde_json::Value,
+) -> bool {
+    match (
+        object.metadata.generation,
+        condition
+            .get("observedGeneration")
+            .and_then(serde_json::Value::as_i64),
+    ) {
+        (Some(generation), Some(observed_generation)) => generation == observed_generation,
+        // Older Agent Sandbox API versions can omit observedGeneration.
+        _ => true,
+    }
+}
+
 fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     let status = obj.data.get("status")?;
     let status_obj = status.as_object()?;
@@ -6762,6 +6787,7 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
         .map(|items| {
             items
                 .iter()
+                .filter(|condition| condition_observes_current_generation(obj, condition))
                 .filter_map(condition_from_value)
                 .collect::<Vec<_>>()
         })
@@ -6899,10 +6925,10 @@ fn sandbox_runtime_namespace_fence_generation_matches(
         == annotations
             .get(ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID)
             .map(String::as_str)
-        && policy.metadata.resource_version.as_deref()
-            == annotations
-                .get(ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION)
-                .map(String::as_str)
+        && annotations
+            .get(ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION)
+            .and_then(|generation| generation.parse::<i64>().ok())
+            == policy.metadata.generation
 }
 
 fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
@@ -6912,8 +6938,9 @@ fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
         .and_then(serde_json::Value::as_array)
         .is_some_and(|conditions| {
             conditions.iter().any(|condition| {
-                condition.get("type").and_then(serde_json::Value::as_str)
-                    == Some(SANDBOX_SUSPENDED_CONDITION)
+                condition_observes_current_generation(obj, condition)
+                    && condition.get("type").and_then(serde_json::Value::as_str)
+                        == Some(SANDBOX_SUSPENDED_CONDITION)
                     && condition
                         .get("status")
                         .and_then(serde_json::Value::as_str)
@@ -6942,8 +6969,9 @@ fn kubernetes_sandbox_stop_failure(obj: &DynamicObject) -> Option<String> {
         .as_array()?
         .iter()
         .find_map(|condition| {
-            let is_terminal = condition.get("type").and_then(serde_json::Value::as_str)
-                == Some(SANDBOX_SUSPENDED_CONDITION)
+            let is_terminal = condition_observes_current_generation(obj, condition)
+                && condition.get("type").and_then(serde_json::Value::as_str)
+                    == Some(SANDBOX_SUSPENDED_CONDITION)
                 && condition
                     .get("status")
                     .and_then(serde_json::Value::as_str)
@@ -7096,7 +7124,7 @@ fn sandbox_runtime_suspension_completion_patch(resource_version: &str) -> serde_
                 ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: serde_json::Value::Null,
-                ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION: serde_json::Value::Null,
+                ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: serde_json::Value::Null,
                 ANNOTATION_SANDBOX_RUNTIME_READINESS: "unavailable",
             },
         }
@@ -8262,6 +8290,58 @@ mod tests {
         ));
     }
 
+    fn sandbox_runtime_fence_pair_for_test() -> (NetworkPolicy, DynamicObject) {
+        let policy = NetworkPolicy {
+            metadata: ObjectMeta {
+                uid: Some("policy-uid".to_string()),
+                generation: Some(7),
+                resource_version: Some("200".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.metadata.annotations = Some(BTreeMap::from([
+            (
+                ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID.to_string(),
+                "policy-uid".to_string(),
+            ),
+            (
+                ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION.to_string(),
+                "7".to_string(),
+            ),
+        ]));
+        (policy, sandbox)
+    }
+
+    #[test]
+    fn sandbox_runtime_fence_reconciliation_uses_generation_not_resource_version() {
+        let (mut policy, sandbox) = sandbox_runtime_fence_pair_for_test();
+
+        assert!(
+            sandbox_runtime_namespace_fence_generation_matches(&policy, &sandbox),
+            "metadata-only writes must not invalidate an unchanged fence"
+        );
+
+        policy.metadata.generation = Some(8);
+        assert!(
+            !sandbox_runtime_namespace_fence_generation_matches(&policy, &sandbox),
+            "a policy spec change must invalidate the recorded fence generation"
+        );
+
+        policy.metadata.generation = Some(7);
+        policy.metadata.uid = Some("replacement-policy-uid".to_string());
+        assert!(
+            !sandbox_runtime_namespace_fence_generation_matches(&policy, &sandbox),
+            "a replacement policy must invalidate the recorded fence identity"
+        );
+    }
+
     #[test]
     fn sandbox_runtime_bootstrap_marker_and_age_gate_rollback() {
         let started = Duration::from_hours(490_896);
@@ -8680,6 +8760,40 @@ mod tests {
             }
         });
         assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
+    }
+
+    #[test]
+    fn stale_generation_conditions_do_not_change_current_status() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.metadata.generation = Some(2);
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Suspended",
+                        "status": "True",
+                        "reason": "PodTerminated",
+                        "observedGeneration": 1
+                    },
+                    {
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "DependenciesReady",
+                        "observedGeneration": 2
+                    }
+                ]
+            }
+        });
+
+        assert!(!kubernetes_sandbox_has_stopped_condition(&sandbox));
+        let status = status_from_object(&sandbox).expect("sandbox status");
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].r#type, "Ready");
     }
 
     #[test]
@@ -11382,7 +11496,7 @@ mod tests {
             ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID,
             ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID,
             ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID,
-            ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_VERSION,
+            ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION,
         ] {
             assert_eq!(
                 complete["metadata"]["annotations"][annotation],
