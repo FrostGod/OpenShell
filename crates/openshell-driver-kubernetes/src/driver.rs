@@ -3719,7 +3719,11 @@ impl KubernetesComputeDriver {
             else {
                 continue;
             };
-            if !sandbox_runtime_namespace_fence_generation_matches(&fence, &object) {
+            let workload_may_run = sandbox_runtime_should_run(&object)
+                || sandbox_runtime_bootstrap_in_progress(&object);
+            if workload_may_run
+                && !sandbox_runtime_namespace_fence_generation_matches(&fence, &object)
+            {
                 warn!(
                     sandbox_id,
                     "namespace workload fence generation changed; suspending stale boundary"
