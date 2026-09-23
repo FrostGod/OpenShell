@@ -3751,7 +3751,8 @@ impl KubernetesComputeDriver {
                 )
                 .await
                 {
-                    SandboxRuntimeControlAvailability::Available => {}
+                    SandboxRuntimeControlAvailability::Available
+                    | SandboxRuntimeControlAvailability::Degraded => {}
                     SandboxRuntimeControlAvailability::Unavailable => {
                         warn!(
                             sandbox_id,
@@ -3777,7 +3778,8 @@ impl KubernetesComputeDriver {
                 )
                 .await
                 {
-                    SandboxRuntimeControlAvailability::Available => {}
+                    SandboxRuntimeControlAvailability::Available
+                    | SandboxRuntimeControlAvailability::Degraded => {}
                     SandboxRuntimeControlAvailability::Unavailable => {
                         warn!(
                             sandbox_id,
@@ -3936,7 +3938,8 @@ impl KubernetesComputeDriver {
     ) {
         let state = match availability {
             SandboxRuntimeControlAvailability::Available => "ready",
-            SandboxRuntimeControlAvailability::Unavailable => "unavailable",
+            SandboxRuntimeControlAvailability::Degraded
+            | SandboxRuntimeControlAvailability::Unavailable => "unavailable",
             SandboxRuntimeControlAvailability::Unknown => return,
         };
         if object
@@ -5164,23 +5167,27 @@ fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<(String, S
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SandboxRuntimeControlAvailability {
     Available,
+    Degraded,
     Unavailable,
     Unknown,
 }
 
 fn sandbox_runtime_control_availability_from_pod(pod: &Pod) -> SandboxRuntimeControlAvailability {
-    if pod.metadata.deletion_timestamp.is_none()
-        && pod
-            .status
-            .as_ref()
-            .and_then(|status| status.conditions.as_ref())
-            .is_some_and(|conditions| {
-                conditions
-                    .iter()
-                    .any(|condition| condition.type_ == "Ready" && condition.status == "True")
-            })
-    {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return SandboxRuntimeControlAvailability::Unavailable;
+    }
+    let status = pod.status.as_ref();
+    let ready = status
+        .and_then(|status| status.conditions.as_ref())
+        .is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+        });
+    if ready {
         SandboxRuntimeControlAvailability::Available
+    } else if status.and_then(|status| status.phase.as_deref()) == Some("Running") {
+        SandboxRuntimeControlAvailability::Degraded
     } else {
         SandboxRuntimeControlAvailability::Unavailable
     }
@@ -5282,6 +5289,8 @@ async fn sandbox_runtime_control_availability(
         SandboxRuntimeControlAvailability::Unavailable
     } else if dependencies.contains(&SandboxRuntimeControlAvailability::Unknown) {
         SandboxRuntimeControlAvailability::Unknown
+    } else if dependencies.contains(&SandboxRuntimeControlAvailability::Degraded) {
+        SandboxRuntimeControlAvailability::Degraded
     } else {
         SandboxRuntimeControlAvailability::Available
     }
@@ -5395,8 +5404,11 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
         // A transient API read failure is not evidence that the running
         // boundary disappeared. Preserve the CR's published readiness for
         // Unknown and let periodic reconciliation retry.
-        if dependencies == SandboxRuntimeControlAvailability::Unavailable
-            || workload_generation == SandboxRuntimeControlAvailability::Unavailable
+        if matches!(
+            dependencies,
+            SandboxRuntimeControlAvailability::Unavailable
+                | SandboxRuntimeControlAvailability::Degraded
+        ) || workload_generation == SandboxRuntimeControlAvailability::Unavailable
             || supervisor_generation == SandboxRuntimeControlAvailability::Unavailable
         {
             mark_sandbox_runtime_control_unavailable(&mut sandbox);
@@ -11370,6 +11382,44 @@ mod tests {
         assert_eq!(
             sandbox_runtime_control_availability_from_pod(&pod),
             SandboxRuntimeControlAvailability::Available
+        );
+    }
+
+    #[test]
+    fn sandbox_runtime_unready_running_supervisor_is_degraded_not_unavailable() {
+        let pod_with = |status: serde_json::Value| Pod {
+            status: Some(serde_json::from_value(status).expect("valid Pod status")),
+            ..Default::default()
+        };
+
+        let reconnecting = pod_with(serde_json::json!({
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "False"}]
+        }));
+        assert_eq!(
+            sandbox_runtime_control_availability_from_pod(&reconnecting),
+            SandboxRuntimeControlAvailability::Degraded
+        );
+
+        for phase in ["Failed", "Succeeded", "Pending"] {
+            let pod = pod_with(serde_json::json!({
+                "phase": phase,
+                "conditions": [{"type": "Ready", "status": "False"}]
+            }));
+            assert_eq!(
+                sandbox_runtime_control_availability_from_pod(&pod),
+                SandboxRuntimeControlAvailability::Unavailable,
+                "phase {phase}"
+            );
+        }
+
+        let mut deleting = reconnecting;
+        deleting.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(k8s_openapi::chrono::Utc::now()),
+        );
+        assert_eq!(
+            sandbox_runtime_control_availability_from_pod(&deleting),
+            SandboxRuntimeControlAvailability::Unavailable
         );
     }
 
