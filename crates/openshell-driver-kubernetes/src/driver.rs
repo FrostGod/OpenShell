@@ -3940,11 +3940,8 @@ impl KubernetesComputeDriver {
         object: &DynamicObject,
         availability: SandboxRuntimeControlAvailability,
     ) {
-        let state = match availability {
-            SandboxRuntimeControlAvailability::Available => "ready",
-            SandboxRuntimeControlAvailability::Degraded
-            | SandboxRuntimeControlAvailability::Unavailable => "unavailable",
-            SandboxRuntimeControlAvailability::Unknown => return,
+        let Some(state) = sandbox_runtime_readiness_state(availability) else {
+            return;
         };
         if object
             .metadata
@@ -5288,15 +5285,31 @@ async fn sandbox_runtime_control_availability(
             SandboxRuntimeControlAvailability::Unknown
         }
     };
-    let dependencies = [control, service, fence, supervisor_fence];
+    combine_sandbox_runtime_control_availability([control, service, fence, supervisor_fence])
+}
+
+fn combine_sandbox_runtime_control_availability(
+    dependencies: [SandboxRuntimeControlAvailability; 4],
+) -> SandboxRuntimeControlAvailability {
     if dependencies.contains(&SandboxRuntimeControlAvailability::Unavailable) {
         SandboxRuntimeControlAvailability::Unavailable
-    } else if dependencies.contains(&SandboxRuntimeControlAvailability::Unknown) {
-        SandboxRuntimeControlAvailability::Unknown
     } else if dependencies.contains(&SandboxRuntimeControlAvailability::Degraded) {
         SandboxRuntimeControlAvailability::Degraded
+    } else if dependencies.contains(&SandboxRuntimeControlAvailability::Unknown) {
+        SandboxRuntimeControlAvailability::Unknown
     } else {
         SandboxRuntimeControlAvailability::Available
+    }
+}
+
+fn sandbox_runtime_readiness_state(
+    availability: SandboxRuntimeControlAvailability,
+) -> Option<&'static str> {
+    match availability {
+        SandboxRuntimeControlAvailability::Available => Some("ready"),
+        SandboxRuntimeControlAvailability::Degraded
+        | SandboxRuntimeControlAvailability::Unavailable => Some("unavailable"),
+        SandboxRuntimeControlAvailability::Unknown => None,
     }
 }
 
@@ -11386,6 +11399,38 @@ mod tests {
         assert_eq!(
             sandbox_runtime_control_availability_from_pod(&pod),
             SandboxRuntimeControlAvailability::Available
+        );
+    }
+
+    #[test]
+    fn sandbox_runtime_degraded_supervisor_is_not_masked_by_unknown_dependency() {
+        use SandboxRuntimeControlAvailability::{Available, Degraded, Unavailable, Unknown};
+
+        let combined =
+            combine_sandbox_runtime_control_availability([Degraded, Unknown, Available, Available]);
+        assert_eq!(combined, Degraded);
+        assert_eq!(
+            sandbox_runtime_readiness_state(combined),
+            Some("unavailable")
+        );
+
+        assert_eq!(
+            combine_sandbox_runtime_control_availability([
+                Degraded,
+                Unknown,
+                Unavailable,
+                Available
+            ]),
+            Unavailable
+        );
+        let unknown = combine_sandbox_runtime_control_availability([
+            Available, Unknown, Available, Available,
+        ]);
+        assert_eq!(unknown, Unknown);
+        assert_eq!(sandbox_runtime_readiness_state(unknown), None);
+        assert_eq!(
+            combine_sandbox_runtime_control_availability([Available; 4]),
+            Available
         );
     }
 
