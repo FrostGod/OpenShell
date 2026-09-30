@@ -37,7 +37,7 @@ pub use crate::commands::provider_readiness::{ProviderWaitOptions, sandbox_provi
 
 use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
-use crate::tls::{TlsOptions, grpc_client};
+use crate::tls::{TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to};
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
@@ -71,6 +71,7 @@ use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use tonic::metadata::AsciiMetadataValue;
 use tonic::{Code, Status};
 
 const PROVISIONAL_CONTAINER_EXIT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1956,7 +1957,7 @@ pub async fn sandbox_exec_grpc(
     let mut client = grpc_client(server, tls).await?;
 
     // Resolve sandbox name to id.
-    let sandbox = client
+    let response = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -1964,7 +1965,9 @@ pub async fn sandbox_exec_grpc(
             )),
         })
         .await
-        .into_diagnostic()?
+        .into_diagnostic()?;
+    let replica = owner_replica(&response);
+    let sandbox = response
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
@@ -2052,16 +2055,23 @@ pub async fn sandbox_exec_grpc(
             stdin_is_terminal,
             std::mem::take(&mut request.stdin),
             stdin_rest,
+            replica.as_ref(),
         )
         .await;
     }
 
     // Make the streaming gRPC call.
-    let mut stream = client
-        .exec_sandbox(request)
+    let mut stream = match client
+        .exec_sandbox(routed_to(request.clone(), replica.as_ref()))
         .await
-        .into_diagnostic()?
-        .into_inner();
+    {
+        Err(status) if retry_unrouted(replica.as_ref(), &status) => {
+            client.exec_sandbox(request).await
+        }
+        response => response,
+    }
+    .into_diagnostic()?
+    .into_inner();
 
     // Stream output to terminal in real-time.
     let mut exit_code = 0i32;
@@ -2114,7 +2124,7 @@ pub async fn service_forward_tcp(
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+    let mut replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
 
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
@@ -2145,7 +2155,7 @@ pub async fn service_forward_tcp(
             }
 
             _ = health_check.tick() => {
-                fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
             }
 
             accepted = listener.accept() => {
@@ -2159,6 +2169,7 @@ pub async fn service_forward_tcp(
                 let target_host = target_host.to_string();
                 let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
                 let fatal_tx = fatal_tx.clone();
+                let replica = replica.clone();
                 tokio::spawn(async move {
                     let token = match create_forward_session_token(
                         &mut client,
@@ -2183,6 +2194,7 @@ pub async fn service_forward_tcp(
                         target_port,
                         service_id,
                         token.clone(),
+                        replica.as_ref(),
                     )
                     .await
                     {
@@ -2217,11 +2229,12 @@ async fn create_forward_session_token(
     Ok(response.into_inner().token)
 }
 
+/// Confirm the sandbox is still ready, returning the replica that owns it.
 async fn fetch_ready_sandbox_for_forward(
     client: &mut crate::tls::GrpcClient,
     name: &str,
     workspace: &str,
-) -> Result<Sandbox> {
+) -> Result<Option<AsciiMetadataValue>> {
     let response = match client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
@@ -2240,6 +2253,7 @@ async fn fetch_ready_sandbox_for_forward(
         Err(status) => return Err(status).into_diagnostic(),
     };
 
+    let replica = owner_replica(&response);
     let sandbox = response
         .into_inner()
         .sandbox
@@ -2253,7 +2267,7 @@ async fn fetch_ready_sandbox_for_forward(
         ));
     }
 
-    Ok(sandbox)
+    Ok(replica)
 }
 
 #[derive(Debug)]
@@ -2319,11 +2333,9 @@ async fn forward_one_tcp_connection(
     target_port: u16,
     service_id: String,
     authorization_token: String,
+    replica: Option<&AsciiMetadataValue>,
 ) -> std::result::Result<(), ForwardTcpConnectionError> {
-    use tokio_stream::wrappers::ReceiverStream;
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
-    tx.send(TcpForwardFrame {
+    let init = TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             TcpForwardInit {
                 sandbox: sandbox_name,
@@ -2336,11 +2348,10 @@ async fn forward_one_tcp_connection(
                 authorization_token,
             },
         )),
-    })
-    .await
-    .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
+    };
+    let (tx, response) = crate::ssh::open_forward_tcp(client, init, replica).await;
 
-    let response = match client.forward_tcp(ReceiverStream::new(rx)).await {
+    let response = match response {
         Ok(response) => response.into_inner(),
         Err(status) => {
             let err = ForwardTcpConnectionError::from_status(status);
@@ -2459,6 +2470,7 @@ async fn sandbox_exec_streaming_grpc(
     stdin_is_terminal: bool,
     stdin_prefix: Vec<u8>,
     stdin_rest: Option<tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    replica: Option<&AsciiMetadataValue>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
@@ -2471,36 +2483,44 @@ async fn sandbox_exec_streaming_grpc(
         (0, 0)
     };
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+    // The start message carries the exec metadata.
+    let start = ExecSandboxInput {
+        payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+            request_id: String::new(),
+            sandbox: sandbox.object_name().to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                (sandbox.object_workspace()).to_string(),
+            )),
+            command: command.to_vec(),
+            workdir: workdir.unwrap_or_default().to_string(),
+            environment: environment.clone(),
+            no_login_shell,
+            execution_timeout: proto_execution_timeout(timeout_seconds)?,
+            stdin: Vec::new(),
+            tty,
+            cols,
+            rows,
+        })),
+    };
 
-    // Send the start message with exec metadata.
-    input_tx
-        .send(ExecSandboxInput {
-            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                request_id: String::new(),
-                sandbox: sandbox.object_name().to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    (sandbox.object_workspace()).to_string(),
-                )),
-                command: command.to_vec(),
-                workdir: workdir.unwrap_or_default().to_string(),
-                environment: environment.clone(),
-                no_login_shell,
-                execution_timeout: proto_execution_timeout(timeout_seconds)?,
-                stdin: Vec::new(),
-                tty,
-                cols,
-                rows,
-            })),
-        })
+    let (mut input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+    input_tx.send(start.clone()).await.into_diagnostic()?;
+    let mut stream = match client
+        .exec_sandbox_interactive(routed_to(ReceiverStream::new(input_rx), replica))
         .await
-        .into_diagnostic()?;
-
-    let mut stream = client
-        .exec_sandbox_interactive(ReceiverStream::new(input_rx))
-        .await
-        .into_diagnostic()?
-        .into_inner();
+    {
+        Err(status) if retry_unrouted(replica, &status) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+            tx.send(start).await.into_diagnostic()?;
+            input_tx = tx;
+            client
+                .exec_sandbox_interactive(ReceiverStream::new(rx))
+                .await
+        }
+        response => response,
+    }
+    .into_diagnostic()?
+    .into_inner();
 
     // Raw mode is only appropriate for an interactive terminal, not a pipe.
     let raw_guard = if tty && stdin_is_terminal {
