@@ -578,7 +578,15 @@ mod linux {
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                // A refused or already-dead peer must not stop the listener.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                    ) => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -3277,6 +3285,7 @@ mod linux {
         Tcp {
             listener: std::net::TcpListener,
             server_config: Arc<rustls::ServerConfig>,
+            reject_local_peers: bool,
         },
     }
 
@@ -3305,12 +3314,13 @@ mod linux {
                     })
                 }
                 BoundaryListenerConfig::TlsTcp { address, tls } => {
-                    let listener = Self::bind_tcp(*address)?;
+                    let (listener, reject_local_peers) = Self::bind_tcp(*address)?;
                     listener.set_nonblocking(true)?;
                     let server_config = Arc::new(load_tls_server_config(tls)?);
                     Ok(Self::Tcp {
                         listener,
                         server_config,
+                        reject_local_peers,
                     })
                 }
             }
@@ -3320,7 +3330,12 @@ mod linux {
         /// before it listens so workload sockets cannot reach it through
         /// loopback or the pod's own address. Configuration rejects loopback
         /// addresses; tests bind them without the filter.
-        fn bind_tcp(address: std::net::SocketAddr) -> io::Result<std::net::TcpListener> {
+        ///
+        /// The filter is a standing guarantee where the kernel allows it, but
+        /// `accept` repeats the check for every non-loopback listener so a
+        /// sandbox behaves the same whatever kernel its node runs. Returns
+        /// whether `accept` must apply it.
+        fn bind_tcp(address: std::net::SocketAddr) -> io::Result<(std::net::TcpListener, bool)> {
             let socket = socket2::Socket::new(
                 socket2::Domain::for_address(address),
                 socket2::Type::STREAM,
@@ -3328,14 +3343,17 @@ mod linux {
             )?;
             socket.set_cloexec(true)?;
             socket.set_reuse_address(true)?;
-            if !address.ip().is_loopback() {
-                openshell_isolation_interface::linux::socket_confinement::reject_loopback_ingress(
+            let reject_local_peers = !address.ip().is_loopback();
+            if reject_local_peers
+                && !openshell_isolation_interface::linux::socket_confinement::try_reject_loopback_ingress(
                     &socket,
-                )?;
+                )?
+            {
+                report_unavailable_ingress_filter();
             }
             socket.bind(&address.into())?;
             socket.listen(128)?;
-            Ok(socket.into())
+            Ok((socket.into(), reject_local_peers))
         }
 
         fn bind_vsock(port: u32) -> io::Result<OwnedFd> {
@@ -3428,8 +3446,12 @@ mod linux {
                 Self::Tcp {
                     listener,
                     server_config,
+                    reject_local_peers,
                 } => {
-                    let (stream, _) = listener.accept()?;
+                    let (stream, peer) = listener.accept()?;
+                    if *reject_local_peers {
+                        reject_workload_tcp_peer(&stream, peer)?;
+                    }
                     if let Err(error) = stream.set_nodelay(true) {
                         tracing::debug!(%error, "Failed to set boundary TCP_NODELAY");
                     }
@@ -3440,6 +3462,42 @@ mod linux {
                 }
             }
         }
+    }
+
+    // Traffic the workload can reach the listener with arrives over `lo`, so one
+    // end is loopback or the two ends share an address. A supervisor runs in
+    // another pod and presents a different address. The peer comes from `accept`
+    // because `getpeername` fails once that peer has reset.
+    fn reject_workload_tcp_peer(
+        stream: &std::net::TcpStream,
+        peer: std::net::SocketAddr,
+    ) -> io::Result<()> {
+        let denied = || io::Error::from_raw_os_error(libc::EACCES);
+        let peer = peer.ip().to_canonical();
+        let local = stream.local_addr().map_err(|_| denied())?.ip().to_canonical();
+        if peer.is_loopback() || local.is_loopback() || peer == local {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    fn report_unavailable_ingress_filter() {
+        tracing::warn!(
+            "Kernel denied SO_ATTACH_FILTER on the boundary control listener; rejecting \
+             same-host control peers on accept instead"
+        );
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Low)
+                .status(openshell_ocsf::StatusId::Failure)
+                .state(openshell_ocsf::StateId::Disabled, "unavailable")
+                .message(
+                    "Boundary loopback-ingress filter unavailable (SO_ATTACH_FILTER denied \
+                     with EPERM); control listener rejects same-host peers on accept"
+                        .to_string()
+                )
+                .build()
+        );
     }
 
     fn reject_workload_unix_peer(stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
@@ -5150,20 +5208,92 @@ mod linux {
                 .tcp_local_addr()
                 .expect("TLS listener address")
                 .port();
-            // Loopback and the host's own address both arrive on `lo`; the
-            // dropped SYN never completes a handshake.
-            let result = std::net::TcpStream::connect_timeout(
+            // The filter drops the SYN; without it the handshake completes and
+            // `accept` refuses the peer instead.
+            let _client = std::net::TcpStream::connect_timeout(
                 &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
                 Duration::from_millis(300),
             );
-            assert!(
-                result.is_err(),
-                "loopback client reached the control listener"
-            );
             assert!(matches!(
                 listener.accept().map(|_| ()),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+                Err(error) if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+                )
             ));
+        }
+
+        /// A control listener in accept-time mode, bound to loopback so a test
+        /// client can actually reach it.
+        fn accept_time_control_listener(
+            directory: &Path,
+            name: &str,
+        ) -> (ControlListener, std::net::SocketAddr) {
+            let (server_tls, _client_tls) = stage_test_tls(directory, name);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+            listener.set_nonblocking(true).expect("nonblocking listener");
+            let address = listener.local_addr().expect("listener address");
+            let server_config =
+                Arc::new(load_tls_server_config(&server_tls).expect("TLS server config"));
+            (
+                ControlListener::Tcp {
+                    listener,
+                    server_config,
+                    reject_local_peers: true,
+                },
+                address,
+            )
+        }
+
+        fn accept_pending(listener: &ControlListener) -> io::Result<()> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    other => return other.map(|_| ()),
+                }
+            }
+        }
+
+        #[test]
+        fn accept_refuses_a_same_host_control_peer_without_the_ingress_filter() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (listener, address) = accept_time_control_listener(directory.path(), "fallback");
+            let _client = std::net::TcpStream::connect(address).expect("connect loopback client");
+            let error = accept_pending(&listener).expect_err("loopback peer refused");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        #[test]
+        fn accept_survives_a_control_peer_that_resets_before_it_is_accepted() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (listener, address) = accept_time_control_listener(directory.path(), "reset");
+            let client = socket2::Socket::new(
+                socket2::Domain::for_address(address),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .expect("client socket");
+            client.connect(&address.into()).expect("connect");
+            // Zero linger makes the close an RST while the connection is still
+            // queued, which is what makes `getpeername` fail with ENOTCONN.
+            client.set_linger(Some(Duration::ZERO)).expect("zero linger");
+            drop(client);
+            let kind = accept_pending(&listener)
+                .expect_err("reset peer refused")
+                .kind();
+            assert!(
+                matches!(
+                    kind,
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+                ),
+                "reset peer produced a listener-fatal error: {kind:?}"
+            );
         }
 
         #[test]

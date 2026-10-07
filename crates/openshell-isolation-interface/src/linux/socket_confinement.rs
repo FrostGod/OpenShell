@@ -38,7 +38,8 @@ pub fn bound_device(fd: impl AsFd) -> io::Result<Option<Vec<u8>>> {
     SockRef::from(&fd).device()
 }
 
-/// Drop TCP/UDP ingress that arrives on the loopback interface.
+/// Try to drop TCP/UDP ingress that arrives on the loopback interface,
+/// reporting whether the kernel allowed it.
 ///
 /// Attach this to a trusted listener whose legitimate clients are never in the
 /// same network namespace. Matching the ingress interface rather than the
@@ -48,13 +49,21 @@ pub fn bound_device(fd: impl AsFd) -> io::Result<Option<Vec<u8>>> {
 /// which marks every descriptor above stdio close-on-exec before running
 /// workload code.
 ///
+/// The fix for CVE-2026-53236 gates `SO_ATTACH_FILTER` on `CAP_NET_ADMIN`, so
+/// on a patched kernel a capability-free caller gets `Ok(false)` and must
+/// reject same-namespace peers some other way.
+///
 /// # Errors
 ///
-/// Returns the kernel error when the interface index cannot be resolved or
-/// the filter cannot be attached.
-pub fn reject_loopback_ingress(fd: impl AsFd) -> io::Result<()> {
+/// Returns the kernel error for any failure other than the gated attach;
+/// `EPERM` from the interface lookup stays an error.
+pub fn try_reject_loopback_ingress(fd: impl AsFd) -> io::Result<bool> {
     let index = rustix::net::netdevice::name_to_index(&fd, "lo")?;
-    reject_ingress_interface(fd, index)
+    match reject_ingress_interface(fd, index) {
+        Ok(()) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn reject_ingress_interface(fd: impl AsFd, index: u32) -> io::Result<()> {
@@ -219,7 +228,10 @@ mod tests {
     #[test]
     fn loopback_ingress_filter_rejects_loopback_connections() {
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        reject_loopback_ingress(&listener).unwrap();
+        if !try_reject_loopback_ingress(&listener).unwrap() {
+            eprintln!("skipping: this kernel gates SO_ATTACH_FILTER on CAP_NET_ADMIN");
+            return;
+        }
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         // Dropped SYNs never complete the handshake.
@@ -235,7 +247,14 @@ mod tests {
         // Positive control: the same program keyed to an absent interface
         // index must leave loopback traffic untouched.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        reject_ingress_interface(&listener, u32::MAX).unwrap();
+        match reject_ingress_interface(&listener, u32::MAX) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                eprintln!("skipping: this kernel gates SO_ATTACH_FILTER on CAP_NET_ADMIN");
+                return;
+            }
+            Err(error) => panic!("attach ingress filter: {error}"),
+        }
         let mut client = connect_with_timeout(listener.local_addr().unwrap()).unwrap();
         let (mut accepted, _) = listener.accept().unwrap();
         client.write_all(b"ping").unwrap();
