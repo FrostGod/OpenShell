@@ -188,10 +188,6 @@ task-memory access through `/proc/<pid>/mem` even when its kernel omits the
 `process_vm_readv` system call; OpenShell qualifies the
 same parent-to-executed-child access shape used by mediated workloads.
 
-The TCP control listener does not require `SO_ATTACH_FILTER` or
-`CAP_NET_ADMIN`. The workload broker reserves the control port, and the
-listener rejects local peers before TLS authentication.
-
 On macOS, these kernel modules run inside the Docker Desktop Linux VM, not on the host kernel.
 
 ### Socket peer addresses
