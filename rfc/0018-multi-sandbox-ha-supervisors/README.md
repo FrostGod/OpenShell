@@ -59,108 +59,96 @@ The sandbox runtime, not the supervisor process, owns the actual workload proces
 - Saving or live-moving agent memory from a failed node.
 - Moving existing TCP, SSH, forwarding, or upstream HTTP connections to another supervisor.
 - Running arbitrary external side effects exactly once.
+- Backend-initiated suspend and wake ([#4352](https://github.com/NVIDIA/OpenShell/issues/4352)). This is a separate task, but the design leaves room for it: suspend can act as a planned release and wake as a new assignment.
 - Removing the trusted sandbox runtime, the outer network fence, or per-sandbox authorization.
 
 ## Proposal
 
 ### 1. Four proposed models
 
-Each deployment answers two questions:
-
-- **Where does the supervisor run?** Per workspace, per node, per sandbox, or per gateway.
-- **How does a sandbox recover when its supervisor fails?** *Restart* or *resume*, described below.
-
-These are candidates to compare, not a decision. All four follow the same safety rules in sections 2 to 4.
+Each deployment answers two questions: **where the supervisor runs** (per workspace, node, sandbox, or gateway) and **how a sandbox recovers** when its supervisor fails (restart or resume). The models are candidates to compare, not a decision. All four follow the safety rules in sections 2 to 4.
 
 | Model | One supervisor serves | Good | Hard |
 | --- | --- | --- | --- |
 | Per workspace | A pool for one workspace | Trust and quotas stay inside the workspace. Fewer Pods. | One failure hits the whole pool. Small workspaces pay for spare capacity. |
-| Per node | The sandboxes on one node (DaemonSet) | Traffic stays on the node. Pod count follows node count. | One failure hits the node, possibly across workspaces. No ready standby on the same node. |
+| Per node | The sandboxes on one node (DaemonSet) | Traffic stays on the node. Pod count follows node count. | One failure hits the node, possibly across workspaces. No ready standby on the node. Fits poorly with backends that move sandboxes between nodes. |
 | Per sandbox (today) | One sandbox, with an optional warm standby | Smallest failure. Simplest isolation. | Most Pods. Slow cold start. |
 | Per gateway | A group tied to one gateway replica | Easy to run as a group. | Gateway rollouts and scale-in also move the group. Needs its own identity and spare capacity. |
 
-Supervisor sessions never run inside the gateway process or Pod. They parse traffic the agent controls, and the gateway Pod holds the signing keys.
+In every model, supervisors run outside the gateway process and Pod: they parse traffic the agent controls, and the gateway Pod holds the signing keys.
 
-A **workspace** is an OpenShell grouping. It is not always one Kubernetes namespace, so assign supervisors by immutable IDs, never by names, Pod IPs, or namespace. A **supervisor replica** is one real process or Pod. Inside it, each sandbox gets its own **session** with its own policy, credentials, gateway connection, queues, and cleanup.
+Terms used below:
 
-**Restart** stops the old run and starts a new one. Files on persistent storage survive. Process memory does not. This is how recovery works today.
-
-**Resume** keeps the agent's processes alive. The runtime freezes them briefly, a new supervisor takes over, and they continue. Open network connections still break. If the node or the runtime itself is lost, only restart is possible.
+- **Workspace:** an OpenShell grouping, not always one Kubernetes namespace. Assign supervisors by immutable IDs, never by names, Pod IPs, or namespace.
+- **Supervisor replica:** one real process or Pod. Inside it, each sandbox gets its own **session** with its own policy, credentials, gateway connection, queues, and cleanup.
+- **Restart:** stop the old run and start a new one. Persistent files survive; process memory does not. This is how recovery works today.
+- **Resume:** keep the agent's processes, freeze them briefly while a new supervisor takes over, then continue. Open network connections still break. If the node or runtime is lost, only restart is possible.
 
 ### 2. Two kinds of owner
 
-Each sandbox has two owners, and they change independently:
+Each sandbox has two owners that change independently:
 
-- **Routing owner:** the gateway replica that holds the sandbox's connection. The supervisor opens this connection, one per sandbox. CLI requests reach the sandbox through it. It moves when a gateway restarts or rebalances (PR #3661). This already works.
+- **Routing owner:** the gateway replica holding the sandbox's connection, which the supervisor opens. CLI requests reach the sandbox through it. It moves when gateways restart or rebalance (PR #3661). This already works.
 - **Enforcement owner:** the one supervisor allowed to apply the sandbox's policy. It moves only when a supervisor is replaced. This RFC adds it.
 
 ```mermaid
 flowchart LR
-    C["CLI"] --> G1["Gateway A"]
-    G1 <-->|"peer forwarding"| G2["Gateway B (routing owner)"]
-    S["Supervisor (enforcement owner)"] -->|"one connection per sandbox"| G2
-    S <-->|"authenticated channel"| R["Sandbox runtime + agent"]
-    G1 & G2 <--> D[("PostgreSQL")]
+    CLI["CLI"] --> GA["Gateway A"]
+    GA <-->|"peer forwarding"| GB["Gateway B<br/>(routing owner)"]
+    SUP["Supervisor<br/>(enforcement owner)"] -->|"one connection per sandbox"| GB
+    SUP <-->|"authenticated channel"| RT["Sandbox runtime + agent"]
+    GA & GB <--> DB[("PostgreSQL")]
 ```
 
-A shared supervisor serving sandboxes A and B still keeps two separate gateway connections. A's connection may sit on gateway 1 and B's on gateway 2. The gateway never connects directly to the workload, and the workload never connects to the gateway.
+A shared supervisor keeps a separate gateway connection for each sandbox, so sandbox A's connection may sit on gateway 1 and B's on gateway 2. The gateway never connects to the workload, and the workload never connects to the gateway.
 
-Add a per-sandbox record, `SupervisorAssignment`. It names the current enforcement owner, and stores an **epoch** that goes up by one every time the owner changes, plus a time-limited lease. Gateways update it with compare-and-swap (CAS): the write succeeds only if nobody changed the record first. The gateway's existing owner record also stores this epoch. Anything from an older epoch is rejected: relays, policy acknowledgements, readiness reports, and late cleanup.
+A new per-sandbox record, `SupervisorAssignment`, names the enforcement owner. It has a lease and an **epoch**, a counter that goes up by one at every owner change. Gateways update it with compare-and-swap (CAS), a write that fails if someone changed the record first. The gateway's owner record carries the same epoch, and anything from an older epoch is rejected: relays, policy acknowledgements, readiness reports, and late cleanup. The same CAS also issues a new `gateway_token_id`, so the old supervisor's token stops working even though resume keeps the run.
 
-Resume keeps the same run, so the old supervisor's token would still pass the gateway's `gateway_token_id` check. When a new owner takes over, the same CAS installs a new `gateway_token_id` and blocks the old token from refreshing.
+**Ready** has one meaning: policy loaded, network mediation running, ownership current, gateway connected, and enforcement confirmed by the runtime. As today, a sandbox stays Ready through a graceful gateway handoff.
 
-**Ready** means one thing everywhere: policy loaded, network mediation running, ownership current, a gateway connection exists, and the runtime has confirmed enforcement. As today, a sandbox stays Ready while its gateway connection is handed off gracefully.
-
-Any gateway can pick a replacement. It chooses a healthy, compatible candidate with free capacity, and leaves healthy assignments alone. The gateway hash ring is not used for this. No single coordinator or global lock is needed.
+Any gateway can pick a replacement: a healthy, compatible candidate with free capacity. Healthy assignments stay where they are. This uses neither the gateway hash ring nor a global lock.
 
 ### 3. Safe handover (fencing)
 
 The rule: **before a new supervisor acts, the old one must be unable to act.** This is called fencing.
 
-Today a sandbox can only reconnect to the same supervisor process (RFC 0012), and the Kubernetes driver ties each sandbox to one supervisor Pod. So replacement needs protocol and authorization changes, not just a different Pod template. Backends add an optional, versioned recovery extension. Backends without it keep working with restart only.
+Today a sandbox can only reconnect to the same supervisor process (RFC 0012), and the Kubernetes driver ties each sandbox to one supervisor Pod. Replacement therefore needs protocol and authorization changes, not just a new Pod template. Backends add an optional, versioned recovery extension; backends without it keep restart only.
 
 ```mermaid
 sequenceDiagram
-    participant O as Old supervisor
-    participant R as Sandbox runtime
-    participant C as New supervisor
-    participant G as Any gateway
-    O--xR: Crash or planned release
-    Note over R: Freeze the agent, block new network requests
-    C->>G: Prove identity, ask to take over
-    G->>G: CAS: reserve epoch e+1
-    G-->>C: Short-lived recovery grant
-    C->>R: Present grant
-    R->>R: Reject epoch e, close old channels
-    R-->>C: Signed receipt + saved state
-    C->>G: Fetch policy, send receipt
-    G->>G: CAS: activate epoch e+1
-    C->>R: Confirm, unfreeze the agent
+    participant Old as Old supervisor
+    participant RT as Sandbox runtime
+    participant New as New supervisor
+    participant GW as Any gateway
+    Old--xRT: Crash or planned release
+    Note over RT: Freeze agent, block new network requests
+    New->>GW: Prove identity, ask to take over
+    GW->>GW: CAS reserve epoch e+1
+    GW-->>New: Short-lived recovery grant
+    New->>RT: Present grant
+    RT->>RT: Reject epoch e, close old channels
+    RT-->>New: Signed receipt and saved state
+    New->>GW: Fetch policy, send receipt
+    GW->>GW: CAS activate epoch e+1
+    New->>RT: Confirm and unfreeze agent
 ```
 
 How it stays safe:
 
-- **Identity is checked, not assumed.** The driver checks the candidate with TokenReview plus a scope mapping. Labels, namespace, or network reachability prove nothing. The gateway then issues a short-lived `RecoveryGrant` tied to the candidate's key, the sandbox, the run, and the new epoch. Launch credentials can never authorize a takeover. Each candidate gets new TLS keys.
-- **A missing heartbeat is not proof.** A new owner is reserved only when the old one released, its lease expired, or the runtime proves it cut the old one off.
-- **The runtime enforces it.** The runtime accepts only the newer epoch, closes old channels, and stays frozen until activation. A database row alone cannot stop a live socket.
-- **If in doubt, stop.** If the runtime cannot freeze or cannot verify enforcement, it stops the agent.
+- **Identity is checked.** The driver verifies the candidate with TokenReview and a scope mapping; labels, namespace, and reachability prove nothing. The gateway then issues a short-lived `RecoveryGrant` bound to the candidate's key, sandbox, run, and new epoch. Launch credentials never authorize a takeover, and each candidate gets new TLS keys.
+- **A missing heartbeat is not proof.** A new owner is reserved only after the old one released, its lease expired, or the runtime proved it cut the old one off.
+- **The runtime enforces it.** It accepts only the newer epoch, closes old channels, and stays frozen until activation. A database row alone cannot stop a live socket.
+- **If in doubt, stop.** If the runtime cannot freeze or verify enforcement, it stops the agent.
 
-**Timing.** The runtime waits about 30 seconds for a supervisor to come back. The gateway owner record expires after 45 seconds, which is too slow, so takeover uses the epoch instead of waiting. Everything must fit in the window:
+**Timing.** The runtime waits about 30 seconds for a supervisor. The gateway owner record takes 45 seconds to expire, so takeover moves the epoch instead of waiting:
 
 `detect + fence + start candidate + restore state + confirm + margin < 30 s`
 
-If PostgreSQL is unavailable, no new takeovers or lease renewals happen. Running sandboxes continue until their lease ends, then freeze and stop. This trades availability for safety. The database must never reuse an epoch, even after a failover or restore.
+If PostgreSQL is down, no takeovers or lease renewals happen. Running sandboxes continue until their lease ends, then freeze and stop, trading availability for safety. The database must never reuse an epoch, even after failover or restore.
 
 ### 4. What survives, and what stays isolated
 
-The runtime holds the true state: processes, exec IDs, deadlines, exit results, and enforcement state. A new supervisor rebuilds from that state plus the approved policy from the gateway. It never relearns trust from the running agent. If binary identity pins or policy revisions cannot be restored, resume is refused.
-
-During resume:
-
-- Commands are never run twice. Exec deadlines are never extended.
-- Missing output is reported as truncated.
-- Proxied connections are closed, and HTTP requests are not replayed.
-- Credentials are fetched fresh. Plaintext secrets are never stored in recovery records.
+The runtime holds the true state: processes, exec IDs, deadlines, exit results, and enforcement. A new supervisor rebuilds from it plus approved policy from the gateway, and never relearns trust from the running agent. If binary identity pins or policy revisions cannot be restored, resume is refused. During resume, commands never run twice and deadlines never extend. Missing output is reported as truncated. Proxied connections close without replaying HTTP requests, and credentials are fetched fresh, never stored in plaintext.
 
 | Today | Change | Still guaranteed |
 | --- | --- | --- |
@@ -169,21 +157,17 @@ During resume:
 | Supervisor state only in memory | State kept by the runtime | No policy rollback. No duplicate exec. |
 | Supervisor lifetime tied to one sandbox | Shared groups with per-session cleanup | Deleting one sandbox cannot affect another. |
 
-**Isolation does not get weaker.** No privileged Pods, host namespaces, or extra capabilities. Seccomp stays in the runtime. Anything that needs more privilege gets its own security review.
-
-**The network fence needs work.** Today the Kubernetes fence only admits supervisor Pods from the same namespace, and editing it suspends every sandbox there. Each model must say which network path it needs, for example a separate driver-owned ingress policy. That path is reviewed as a fence change. A shared supervisor also sends all its sandboxes' traffic from one Pod IP, so upstream rules and attribution based on IP can no longer separate sandboxes.
-
-**Inside a shared process,** every sandbox has its own policy, credentials, caches, connection pools, relays, logs, and quotas. Software separation still is not as strong as a separate process.
+- **Isolation does not get weaker.** No privileged Pods, host namespaces, or extra capabilities. Seccomp stays in the runtime. Anything needing more privilege gets its own security review.
+- **The network fence needs work.** The Kubernetes fence admits supervisor Pods only from the same namespace, and editing it suspends every sandbox there. Each model must name the network path it needs, such as a separate driver-owned ingress policy, reviewed as a fence change. A shared supervisor also sends all its sandboxes' traffic from one Pod IP, so IP-based upstream rules and attribution can no longer tell sandboxes apart.
+- **A shared process separates by sandbox:** policy, credentials, caches, connection pools, relays, logs, and quotas. Software separation is still weaker than a separate process.
 
 ### 5. Operator settings, capacity, and failures
 
-New settings choose the model, the recovery mode, allowed fallbacks, spare capacity, per-sandbox quotas, and time limits for draining and recovery. A workload's own policy cannot widen these. The gateway records the settings each run started with and shows the effective mode. By default, a failed resume starts a fresh run, the same as restart. Ending the sandbox instead must be an explicit operator choice.
+New settings choose the model, recovery mode, allowed fallbacks, spare capacity, per-sandbox quotas, and drain and recovery time limits. A workload's policy cannot widen them. Each run records the settings it started with, and operators see the effective mode. A failed resume starts a fresh run by default; ending the sandbox instead is an explicit operator choice.
 
-**Pod count.** For `N` sandboxes and `R` shared supervisors, the count is about `N + R`. Today it is `2N`, or `3N` with a warm standby per sandbox. Gateway connections still number `N`.
-
-**Relay limits.** Today each gateway replica allows 256 unclaimed relays, and each sandbox 32. The 32 cap only isolates a stuck supervisor that serves one sandbox. Add a gateway-side cap per supervisor replica.
-
-Plan capacity for sessions, throughput, memory, file descriptors, bandwidth, and the largest group that fails together. Spare capacity must be usable by the affected workspace. If the failure budget cannot be met, reject the sandbox or mark HA as degraded.
+- **Pod count:** about `N + R` for `N` sandboxes and `R` shared supervisors, versus `2N` today or `3N` with warm standbys. Gateway connections stay at `N`. If idle sandboxes release their sessions, size by active sandboxes.
+- **Relay limits:** each gateway replica allows 256 unclaimed relays and each sandbox 32. The 32 cap only isolates a stuck supervisor that serves one sandbox, so add a gateway-side cap per supervisor replica.
+- **Capacity planning:** cover sessions, throughput, memory, file descriptors, bandwidth, and the largest group that fails together. Spare capacity must be usable by the affected workspace. If the failure budget cannot be met, reject the sandbox or mark HA as degraded.
 
 | Event | What happens |
 | --- | --- |
@@ -196,19 +180,17 @@ Plan capacity for sessions, throughput, memory, file descriptors, bandwidth, and
 | Supervisor upgrade, scale-in, or drain of a supervisor-only node | Stop new assignments, hand each session over with fencing within the 30-second grace period, then stop. |
 | Sandbox stop or delete, or authority revoked | Cancel grants. Cleanup wins over a pending recovery and does not touch other sessions. |
 
-Draining a gateway and draining a supervisor are separate. Remote fallback for per-node supervisors is opt-in. A DaemonSet surge helps planned upgrades but is not a crash standby. Use topology spread, resource reservations, and PDBs; PDBs do not stop crashes or controller rollouts. See the [DaemonSet update](https://kubernetes.io/docs/tasks/manage-daemon/update-daemon-set/) and [disruption](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/) guides.
-
-Report assignment and recovery state, rejected stale owners, recovery time and outcome, spare capacity, and per-replica load. Keep sandbox IDs out of metric labels. Measure how long agents stay frozen separately from client reconnect time, and publish measured recovery times for each backend.
+Gateway and supervisor drains are separate, and remote fallback for per-node supervisors is opt-in. Use topology spread and resource reservations. A DaemonSet surge helps planned upgrades but is no crash standby, and PDBs stop neither crashes nor controller rollouts ([DaemonSet updates](https://kubernetes.io/docs/tasks/manage-daemon/update-daemon-set/), [disruptions](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/)). Report assignment and recovery state, rejected stale owners, recovery outcomes, spare capacity, and per-replica load, keeping sandbox IDs out of metric labels. Measure agent freeze time separately from client reconnect time, and publish recovery times per backend.
 
 ### 6. Who does what, and compatibility
 
 - **Gateway:** assignments, grants, and routing.
-- **Compute driver:** creates candidates and does fenced cleanup. Today its reconciler suspends a sandbox when the dedicated supervisor Pod is missing or replaced. It must read `SupervisorAssignment` instead, and its singleton lease must be fenced too.
+- **Compute driver:** creates candidates and does fenced cleanup. Its reconciler, which today suspends a sandbox whose dedicated supervisor Pod is missing or replaced, must read `SupervisorAssignment` instead, under a fenced singleton lease.
 - **Runtime and backend:** fencing and process state.
 - **Supervisor:** separate per-sandbox contexts and approved configuration.
-- **Controllers and Helm:** pools, placement, resources, and disruption settings. They cannot authorize a takeover.
+- **Controllers and Helm:** pools, placement, resources, and disruption settings, with no power to authorize a takeover.
 
-Existing installations keep today's behavior (per sandbox, restart only) unless operators opt in. Mixed versions reject resume they do not support. A running sandbox keeps the mode it started with. Docker, Podman, VM, and MXC keep their current behavior until each passes the conformance tests.
+Existing installations keep today's behavior (per sandbox, restart only) unless operators opt in. Mixed versions reject resume they do not support, and a running sandbox keeps the mode it started with. Docker, Podman, VM, and MXC keep current behavior until each passes the conformance tests.
 
 ## Implementation plan
 
