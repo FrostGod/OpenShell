@@ -66,7 +66,7 @@ The sandbox runtime, not the supervisor process, owns the actual workload proces
 
 ### 1. Four proposed models
 
-Each deployment answers two questions: **where the supervisor runs** (per workspace, node, sandbox, or gateway) and **how a sandbox recovers** when its supervisor fails (restart or resume). The models are candidates to compare, not a decision. All four follow the safety rules in sections 2 to 4.
+Each deployment answers two questions: **where the supervisor runs** (per workspace, node, sandbox, or gateway) and **how a sandbox recovers** when its supervisor fails (restart or resume). The models are candidates to compare, not a decision. All four follow the safety rules in sections 2 to 5.
 
 | Model | One supervisor serves | Good | Hard |
 | --- | --- | --- | --- |
@@ -161,7 +161,33 @@ The runtime holds the true state: processes, exec IDs, deadlines, exit results, 
 - **The network fence needs work.** The Kubernetes fence admits supervisor Pods only from the same namespace, and editing it suspends every sandbox there. Each model must name the network path it needs, such as a separate driver-owned ingress policy, reviewed as a fence change. A shared supervisor also sends all its sandboxes' traffic from one Pod IP, so IP-based upstream rules and attribution can no longer tell sandboxes apart.
 - **A shared process separates by sandbox:** policy, credentials, caches, connection pools, relays, logs, and quotas. Software separation is still weaker than a separate process.
 
-### 5. Operator settings, capacity, and failures
+### 5. Workload identity
+
+Sharing a supervisor must preserve each sandbox's workload identity. For Kubernetes deployments using pod-specific SPIFFE Verifiable Identity Documents (SVIDs), the identity issuer must distinguish individual Sandbox Pods, even when they share a service account. The shared proxy Supervisor Pod's service identity does not represent the workloads it supervises.
+
+The gRPC client running in the Sandbox Pod MUST obtain that Pod's SVID through the [SPIFFE Workload API](https://spiffe.io/docs/latest/deploying/svids/) Unix domain socket (UDS) exposed locally in the Sandbox Pod and pass the SVID over the authenticated gRPC connection to the Supervisor running in the shared proxy Supervisor Pod. Access to the UDS must preserve workload attestation so the client receives only identities authorized for its Sandbox Pod.
+
+```mermaid
+sequenceDiagram
+    participant Client as gRPC client (Sandbox Pod)
+    participant API as SPIFFE Workload API (local UDS)
+    participant Supervisor as Supervisor (shared proxy Pod)
+    participant Provider as Dynamic Credential Provider
+    Client->>API: Request Sandbox Pod SVID via local UDS
+    API-->>Client: Sandbox Pod SVID
+    Client->>Supervisor: Send Sandbox SVID over authenticated gRPC
+    Supervisor->>Supervisor: Validate SVID and bind to sandbox/run session
+    Supervisor->>Provider: Exchange using Sandbox SVID as workload identity
+    Provider-->>Supervisor: Credentials scoped to that sandbox
+```
+
+The Supervisor MUST validate the SVID against the configured trust bundle and expected workload identity, including validity and audience where applicable, and bind it to the authenticated sandbox/run session and current ownership epoch. A caller-supplied sandbox ID alone cannot establish that binding. The validated Sandbox SVID MUST be used as the workload identity for dynamic Credential Provider exchange and other identity-dependent operations performed on behalf of that sandbox. The Supervisor must not substitute its own SVID: doing so would collapse distinct sandbox identities into one shared identity and lose per-sandbox authorization and attribution.
+
+The exchange protocol must specify the SVID form, intended audience, and proof required by each provider. For bearer-token exchange, the client obtains a JWT-SVID for the intended recipient; an X.509-SVID certificate alone is not proof of possession. X.509 private keys MUST remain in the Sandbox Pod and must never be forwarded to the Supervisor.
+
+Identity context and exchanged credential caches remain scoped to the sandbox/run, provider, and audience. The client refreshes the SVID before expiry and forwards updates to the active Supervisor. After fenced handover, the client supplies a current SVID to the replacement Supervisor, which validates and binds it to the new session and epoch before fetching fresh credentials. Missing, expired, or mismatched identity must fail closed for operations requiring it, without falling back to another sandbox's identity or the Supervisor's identity. Workload identity does not replace the recovery grant or fencing rules in section 3.
+
+### 6. Operator settings, capacity, and failures
 
 New settings choose the model, recovery mode, allowed fallbacks, spare capacity, per-sandbox quotas, and drain and recovery time limits. A workload's policy cannot widen them. Each run records the settings it started with, and operators see the effective mode. A failed resume starts a fresh run by default; ending the sandbox instead is an explicit operator choice.
 
@@ -182,7 +208,7 @@ New settings choose the model, recovery mode, allowed fallbacks, spare capacity,
 
 Gateway and supervisor drains are separate, and remote fallback for per-node supervisors is opt-in. Use topology spread and resource reservations. A DaemonSet surge helps planned upgrades but is no crash standby, and PDBs stop neither crashes nor controller rollouts ([DaemonSet updates](https://kubernetes.io/docs/tasks/manage-daemon/update-daemon-set/), [disruptions](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/)). Report assignment and recovery state, rejected stale owners, recovery outcomes, spare capacity, and per-replica load, keeping sandbox IDs out of metric labels. Measure agent freeze time separately from client reconnect time, and publish recovery times per backend.
 
-### 6. Who does what, and compatibility
+### 7. Who does what, and compatibility
 
 - **Gateway:** assignments, grants, and routing.
 - **Compute driver:** creates candidates and does fenced cleanup. Its reconciler, which today suspends a sandbox whose dedicated supervisor Pod is missing or replaced, must read `SupervisorAssignment` instead, under a fenced singleton lease.
