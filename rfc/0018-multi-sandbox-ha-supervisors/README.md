@@ -174,29 +174,29 @@ During resume:
 
 ### 5. Workload identity
 
-Sharing a supervisor must preserve each sandbox's workload identity. For Kubernetes deployments using pod-specific SPIFFE Verifiable Identity Documents (SVIDs), the identity issuer must distinguish individual Sandbox Pods, even when they share a service account. The shared proxy Supervisor Pod's service identity does not represent the workloads it supervises.
+These requirements apply to shared supervisors; they do not change identity acquisition for dedicated supervisors. Each sandbox MUST retain its own workload identity, even when sandboxes share a Kubernetes service account. A supervisor's service identity MUST NOT substitute for a sandbox's identity.
 
-The gRPC client running in the Sandbox Pod MUST obtain that Pod's SVID through the [SPIFFE Workload API](https://spiffe.io/docs/latest/deploying/svids/) Unix domain socket (UDS) exposed locally in the Sandbox Pod and pass the SVID over the authenticated gRPC connection to the Supervisor running in the shared proxy Supervisor Pod. Access to the UDS must preserve workload attestation so the client receives only identities authorized for its Sandbox Pod.
+The supervisor requests a short-lived, audience-specific JWT-SVID on demand through a trusted identity-acquisition interface. The interface authorizes the requesting supervisor for the sandbox, run, and current ownership epoch. Direct [SPIFFE Workload API](https://spiffe.io/docs/latest/deploying/svids/) access occurs in a trusted component in the Sandbox Pod, which obtains the sandbox's SVID and returns it over the authenticated, encrypted runtime channel. The supervisor initiates that channel today; this proposal does not assume an existing sandbox-side gRPC client. Delegated acquisition is another option, but its authority and workload binding require separate review; node-wide delegation must not be treated as authorization for only the supervisor's assigned sandboxes.
+
+The acquisition mechanism is backend-specific. Kata's host-to-guest UDS limitation is independent of supervisor topology. For example, a [Teleport bot](https://goteleport.com/docs/reference/machine-workload-identity/workload-identity/workload-identity-api-and-workload-attestation/) sidecar inside the Kata VM can expose a guest-local Workload API socket. This requires sandbox-scoped issuance authority and protection of the socket, bot credentials, and configuration from agent processes. This is a deployment option to validate, not a requirement to adopt Teleport. Sharing a Pod or UID does not establish runtime/agent separation; each backend must demonstrate that boundary without relying on a blanket denial of all agent Unix-socket use.
 
 ```mermaid
 sequenceDiagram
-    participant Client as gRPC client (Sandbox Pod)
-    participant API as SPIFFE Workload API (local UDS)
-    participant Supervisor as Supervisor (shared proxy Pod)
-    participant Provider as Dynamic Credential Provider
-    Client->>API: Request Sandbox Pod SVID via local UDS
-    API-->>Client: Sandbox Pod SVID
-    Client->>Supervisor: Send Sandbox SVID over authenticated gRPC
-    Supervisor->>Supervisor: Validate SVID and bind to sandbox/run session
-    Supervisor->>Provider: Exchange using Sandbox SVID as workload identity
-    Provider-->>Supervisor: Credentials scoped to that sandbox
+    participant Supervisor as Shared supervisor
+    participant Identity as Trusted identity acquisition
+    participant Handler as Authorized provider or middleware
+    Supervisor->>Identity: Request JWT-SVID for sandbox/run/epoch and audience
+    Identity->>Identity: Check assignment and obtain sandbox identity
+    Identity-->>Supervisor: Short-lived sandbox JWT-SVID
+    Supervisor->>Supervisor: Validate identity and bind to current session
+    Supervisor->>Handler: Use SVID only for the admitted operation
 ```
 
-The Supervisor MUST validate the SVID against the configured trust bundle and expected workload identity, including validity and audience where applicable, and bind it to the authenticated sandbox/run session and current ownership epoch. A caller-supplied sandbox ID alone cannot establish that binding. The validated Sandbox SVID MUST be used as the workload identity for dynamic Credential Provider exchange and other identity-dependent operations performed on behalf of that sandbox. The Supervisor must not substitute its own SVID: doing so would collapse distinct sandbox identities into one shared identity and lose per-sandbox authorization and attribution.
+The supervisor MUST validate the SVID's signature, trust domain, validity, audience, and expected sandbox identity. When the gateway accepts an SVID for credential exchange or another sandbox operation, it MUST independently validate it and match its subject to the sandbox authenticated by that session. The expected identity mapping comes from trusted control-plane state, not caller-supplied IDs or headers. Both checks bind use to the current sandbox/run and ownership epoch. The acquisition and exchange protocols must specify the SVID form and required proof; an X.509-SVID certificate alone is not proof of possession, and private keys MUST NOT be forwarded to a shared supervisor.
 
-The exchange protocol must specify the SVID form, intended audience, and proof required by each provider. For bearer-token exchange, the client obtains a JWT-SVID for the intended recipient; an X.509-SVID certificate alone is not proof of possession. X.509 private keys MUST remain in the Sandbox Pod and must never be forwarded to the Supervisor.
+Trusted middleware and other request handlers may use this interface when explicitly authorized. For example, a middleware can inject the sandbox's JWT-SVID into a configured `X-Workload-SVID` header so a receiving service or middleware can validate the workload identity and authorize it. The audience identifies that verifier. Acquisition and injection follow policy admission, remain bound to the configured destination, and replace any agent-supplied value for that header. SVIDs and reusable credential handles MUST NOT enter agent-visible state or responses, or appear in logs or traces. A required identity acquisition or validation failure prevents forwarding.
 
-Identity context and exchanged credential caches remain scoped to the sandbox/run, provider, and audience. The client refreshes the SVID before expiry and forwards updates to the active Supervisor. After fenced handover, the client supplies a current SVID to the replacement Supervisor, which validates and binds it to the new session and epoch before fetching fresh credentials. Missing, expired, or mismatched identity must fail closed for operations requiring it, without falling back to another sandbox's identity or the Supervisor's identity. Workload identity does not replace the recovery grant or fencing rules in section 3.
+Cache SVIDs and exchanged credentials separately by sandbox/run, ownership epoch, provider or authorized handler, and audience, never beyond their validity. Refresh on demand before expiry. After handover, the replacement supervisor re-establishes the current identity binding before acquiring or using credentials; an old epoch cannot continue acquisition or reuse cached authority. Missing, expired, or mismatched identity fails closed without falling back to another sandbox or the supervisor's identity. Workload identity does not replace the recovery grants or fencing rules in section 3.
 
 ### 6. Operator settings, capacity, and failures
 
