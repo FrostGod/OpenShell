@@ -21,6 +21,7 @@ All four models share the same safety rules, listed here:
 - Each sandbox has only one active supervisor at a time. Before a replacement takes over, the old supervisor must lose its power to act. This is called fencing.
 - A replacement can keep the agent process running only if the sandbox runtime can safely recover. Otherwise, recovery starts a fresh sandbox run.
 - If only a gateway fails, the supervisor reconnects to another gateway. This does not require replacing the supervisor or restarting the agent.
+
 ## Motivation
 
 Today, Kubernetes runs the workload and the supervisor in separate Pods. Gateway HA handles a gateway failing. It does not replace a failed supervisor while keeping its workload running. Sharing supervisors would save Pods, but one failure would then affect more sandboxes.
@@ -275,3 +276,9 @@ Some details are left to implementation and are out of scope for this RFC: how a
 - Which local-node and gateway-group affinity rules may operators relax?
 - Which security and execution state must be saved before resume is safe?
 - Is the exposure from a compromised shared process acceptable, or do we need separate worker processes?
+
+## Verdict
+
+We are not picking one model over the others. Teams have different requirements for failure scope, isolation, and security, so one choice cannot fit every deployment. All four models share the safety rules in this RFC, so adding a model later does not change those rules.
+
+Implementation starts with the per-gateway model, which is already in progress. We will add the per-node, per-workspace, or warm-standby per-sandbox models when a deployment needs them, each behind its own opt-in setting and only after it passes the failure tests.
