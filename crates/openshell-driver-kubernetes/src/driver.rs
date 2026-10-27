@@ -3863,10 +3863,14 @@ impl KubernetesComputeDriver {
                     .await
                     .map_err(|error| match error {
                         LaunchError::Persist(error) => error,
-                        // The host is at capacity; the create fails before
-                        // its workload runs.
+                        // The host is at capacity, or the pool could not
+                        // place the instance; the create fails before its
+                        // workload runs.
                         LaunchError::Refused(error) => {
                             KubernetesDriverError::Precondition(error.to_string())
+                        }
+                        LaunchError::Unplaced(reason) => {
+                            KubernetesDriverError::Precondition(reason)
                         }
                         LaunchError::Invalid(error) => {
                             KubernetesDriverError::Message(error.to_string())

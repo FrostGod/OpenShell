@@ -71,9 +71,9 @@ replica, independent of which replica runs the compute driver's watch:
   the owner record, charges the member's capacity, and publishes the
   `Admitting` record, conditioned on that record's version, so an owner always
   has its published instance and a removed record never gains one. A member at
-  its 256-instance capacity is skipped. With no live member with room the
-  launch is refused as a capacity refusal: it removes the admitting record it
-  created, only at the version it created (a concurrent launch of the same
+  its 256-instance capacity is skipped. With no live member, or none with
+  room, the launch is refused with that reason: it removes the admitting
+  record it created, only at the version it created (a concurrent launch of the same
   generation that admitted it first wins), and then that record's candidate
   and material; a removal that fails is left to fencing. One
   `supervisor_instance_owner` record per instance names the member, its
