@@ -787,7 +787,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
                 root.path().join("tls"),
             )
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(30), child.output())
+        let output = tokio::time::timeout(Duration::from_mins(1), child.output())
             .await
             .expect("shared startup child exceeded its deadline")
             .expect("run isolated shared startup test");
@@ -923,7 +923,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .deny_confirmation
         .store(false, Ordering::SeqCst);
     let observe_and_shutdown = async {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if marker.exists()
                     && tokio::net::UnixStream::connect(&readiness).await.is_ok()

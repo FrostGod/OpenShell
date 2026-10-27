@@ -1325,7 +1325,7 @@ The sandbox runtime writes these OCSF findings to the workload Pod log:
 
 The recovery timeout is the gateway's
 `[openshell.gateway.supervisor_pool] recovery_timeout_secs` (Helm
-`supervisor.recoveryTimeoutSeconds`, 10 to 300 seconds, default 60). Each pool
+`supervisor.recoveryTimeoutSeconds`, 30 to 300 seconds, default 60). Each pool
 supervisor offers it to a sandbox runtime when it attaches. A graceful leave hands instances over at
 once.
 A lost node takes up to about 22 seconds to detect, before the replacement

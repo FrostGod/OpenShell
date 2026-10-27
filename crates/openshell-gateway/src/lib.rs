@@ -278,6 +278,13 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .map_err(openshell_core::Error::config)
     }
 
+    fn uses_shared_supervision(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<bool> {
+        Ok(kubernetes_config(context)?.shared_supervisor.is_some())
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,

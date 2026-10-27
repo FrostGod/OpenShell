@@ -1013,7 +1013,7 @@ fn run_effective_config_preflight(
         let mut selected_driver = None;
         if let Some(selection) = selection.as_ref() {
             validate_preflight_isolation_backend(semantic_file, selection.name())?;
-            selected_driver = Some(crate::validate_compute_driver_config(
+            let driver = crate::validate_compute_driver_config(
                 compute_drivers,
                 selection.name(),
                 run.name.trim(),
@@ -1021,7 +1021,15 @@ fn run_effective_config_preflight(
                 &run.log_level,
                 driver_startup,
                 true,
-            )?);
+            )?;
+            crate::validate_supervisor_pool_consumer(
+                &driver,
+                run.name.trim(),
+                SocketAddr::new(run.bind_address, run.port),
+                &run.log_level,
+                driver_startup,
+            )?;
+            selected_driver = Some(driver);
         } else if file.is_some() {
             // Runtime auto-detection may connect local API sockets or launch a
             // bounded discovery command. Preflight must not perform those
@@ -1673,6 +1681,30 @@ mod tests {
             _context: crate::ComputeDriverBuildContext<'_>,
         ) -> openshell_core::Result<crate::ComputeDriverInstance> {
             unreachable!("CLI metadata tests do not build drivers")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct SharedSupervisionFactory;
+
+    #[async_trait::async_trait]
+    impl crate::ComputeDriverFactory for SharedSupervisionFactory {
+        fn supports_config_preflight(&self) -> bool {
+            true
+        }
+
+        fn uses_shared_supervision(
+            &self,
+            _context: crate::ComputeDriverConfigContext<'_>,
+        ) -> openshell_core::Result<bool> {
+            Ok(true)
+        }
+
+        async fn build(
+            &self,
+            _context: crate::ComputeDriverBuildContext<'_>,
+        ) -> openshell_core::Result<crate::ComputeDriverInstance> {
+            unreachable!("preflight must not build the selected driver")
         }
     }
 
@@ -2413,6 +2445,57 @@ mod tests {
                 .expect_err("selected driver validation hook must run");
                 assert!(error.to_string().contains("validation hook invoked"));
                 assert_eq!(REJECTING_VALIDATION_CALLS.load(Ordering::SeqCst), 1);
+            });
+    }
+
+    #[test]
+    fn config_preflight_rejects_supervisor_pool_without_a_shared_supervision_driver() {
+        let config_home = tempfile::tempdir().unwrap();
+        let config = config_home.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            "[openshell]\nversion = 2\n\n[openshell.gateway.supervisor_pool]\nrecovery_timeout_secs = 60\n",
+        )
+        .unwrap();
+        let preflight = |registry: &crate::ComputeDriverRegistry| {
+            let (run, matches) = parse_with_args(&[
+                "openshell-gateway",
+                "--compute-driver",
+                "local",
+                "--disable-tls",
+            ]);
+            super::run_config_preflight_with_drivers(
+                super::ConfigPreflightArgs {
+                    path: Some(config.clone()),
+                    ..Default::default()
+                },
+                run,
+                &matches,
+                registry,
+            )
+        };
+
+        Environment::new()
+            .remove("OPENSHELL_GATEWAY_CONFIG")
+            .remove("OPENSHELL_COMPUTE_DRIVER")
+            .remove("OPENSHELL_DRIVERS")
+            .run(|| {
+                preflight(&test_registry("local", false))
+                    .expect_err("a pool table without a shared supervision driver must fail");
+
+                let mut registry = crate::ComputeDriverRegistry::new();
+                registry
+                    .install(
+                        crate::ComputeDriverRegistration::new(
+                            "local",
+                            100,
+                            None,
+                            SharedSupervisionFactory,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                preflight(&registry).expect("a shared supervision driver consumes the pool table");
             });
     }
 

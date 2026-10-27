@@ -224,7 +224,7 @@ pub struct GatewayFileSection {
 #[serde(deny_unknown_fields)]
 pub struct SupervisorPoolConfig {
     /// Seconds a sandbox runtime keeps its workload frozen after losing its
-    /// supervisor before terminating it, from 10 to 300. The pool's
+    /// supervisor before terminating it, from 30 to 300. The pool's
     /// supervisors offer it to each runtime; unset offers
     /// [`openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -864,12 +864,12 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         .supervisor_pool
         .and_then(|pool| pool.recovery_timeout_secs)
         .is_some_and(|timeout| {
-            !openshell_supervisor_control::SUPERVISOR_RECOVERY_TIMEOUT_RANGE.contains(&timeout)
+            !openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_RANGE.contains(&timeout)
         })
     {
         return Err(ConfigFileError::InvalidValue {
             field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
-            message: "must be between 10 and 300 seconds",
+            message: "must be between 30 and 300 seconds",
         });
     }
     if let Some((name, _)) = file
@@ -1970,7 +1970,14 @@ database_lock_max_connections = 0
         );
         // Recovery stays bounded, and unknown keys, including the removed
         // `enabled` switch, are refused.
-        for out_of_range in ["9", "301"] {
+        assert_eq!(
+            pool("recovery_timeout_secs = 30\n")
+                .unwrap()
+                .unwrap()
+                .recovery_timeout_secs,
+            Some(30)
+        );
+        for out_of_range in ["10", "29", "301"] {
             assert!(matches!(
                 pool(&format!("recovery_timeout_secs = {out_of_range}\n")),
                 Err(ConfigFileError::InvalidValue {
