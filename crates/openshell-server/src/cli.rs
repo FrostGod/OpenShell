@@ -1031,6 +1031,14 @@ fn run_effective_config_preflight(
             )?;
             selected_driver = Some(driver);
         } else if file.is_some() {
+            // Preflight cannot run driver detection probes. A pool table must
+            // name its consumer so this check cannot silently pass for a
+            // driver that will reject the table at startup.
+            if semantic_file.openshell.gateway.supervisor_pool.is_some() {
+                return Err(miette::miette!(
+                    "openshell.gateway.supervisor_pool requires an explicit compute driver for config preflight"
+                ));
+            }
             // Runtime auto-detection may connect local API sockets or launch a
             // bounded discovery command. Preflight must not perform those
             // side effects, so validate every configured table that could be
@@ -2496,6 +2504,18 @@ mod tests {
                     )
                     .unwrap();
                 preflight(&registry).expect("a shared supervision driver consumes the pool table");
+
+                let (run, matches) = parse_with_args(&["openshell-gateway", "--disable-tls"]);
+                super::run_config_preflight_with_drivers(
+                    super::ConfigPreflightArgs {
+                        path: Some(config.clone()),
+                        ..Default::default()
+                    },
+                    run,
+                    &matches,
+                    &detected_local_registry(),
+                )
+                .expect_err("a pool table without an explicit driver cannot be preflighted");
             });
     }
 
