@@ -40,6 +40,7 @@ _ClientCallDetailsBase = namedtuple(
 _OAUTH_MAX_RESPONSE_BYTES = 1 << 20
 _PAGER_MAX_CONSUMED_TOKENS = 10_000
 _PAGER_MAX_CONSUMED_TOKEN_BYTES = 1 << 20
+# Replica routing headers and retry rule: docs/kubernetes/ingress.mdx.
 _OWNER_REPLICA_HEADER = "x-openshell-owner"
 _OWNER_REQUEST_HEADER = "x-openshell-want-owner"
 _ROUTE_REPLICA_HEADER = "x-openshell-replica"
@@ -150,6 +151,12 @@ def _workspace_scope(workspace: str) -> datamodel_pb2.WorkspaceSelector:
     if not workspace:
         raise ValueError("workspace must be non-empty")
     return datamodel_pb2.WorkspaceSelector(workspace=workspace)
+
+
+def _get_sandbox_request(name: str, workspace: str) -> openshell_pb2.GetSandboxRequest:
+    return openshell_pb2.GetSandboxRequest(
+        workspace_scope=_workspace_scope(workspace), name=name
+    )
 
 
 def _all_workspaces_scope() -> datamodel_pb2.WorkspaceSelector:
@@ -1015,10 +1022,7 @@ class SandboxClient:
 
     def get(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
-            openshell_pb2.GetSandboxRequest(
-                workspace_scope=_workspace_scope(workspace),
-                name=name,
-            ),
+            _get_sandbox_request(name, workspace),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
@@ -1363,16 +1367,14 @@ class SandboxClient:
             return owner
         try:
             _, call = self._stub.GetSandbox.with_call(
-                openshell_pb2.GetSandboxRequest(
-                    workspace_scope=_workspace_scope(workspace),
-                    name=sandbox,
-                ),
+                _get_sandbox_request(sandbox, workspace),
                 timeout=self._timeout,
                 metadata=((_OWNER_REQUEST_HEADER, "1"),),
             )
         except grpc.RpcError:
             return ""
-        owner = dict(call.initial_metadata() or ()).get(_OWNER_REPLICA_HEADER, "")
+        value = dict(call.initial_metadata() or ()).get(_OWNER_REPLICA_HEADER)
+        owner = value if isinstance(value, str) else ""
         self._owners.put(workspace, sandbox, owner)
         return owner
 

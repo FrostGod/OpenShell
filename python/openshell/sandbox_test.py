@@ -53,7 +53,7 @@ from openshell.sandbox import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
 
 def _request_workspace(request: Any) -> str | None:
@@ -485,7 +485,7 @@ class _RoutingGateway(openshell_pb2_grpc.OpenShellServicer):
 
 
 @contextlib.contextmanager
-def _routing_client(gateway: _RoutingGateway) -> Iterator[SandboxClient]:
+def _routing_client(gateway: _RoutingGateway) -> Generator[SandboxClient]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     openshell_pb2_grpc.add_OpenShellServicer_to_server(gateway, server)
     port = server.add_insecure_port("127.0.0.1:0")
